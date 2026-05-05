@@ -1,6 +1,6 @@
 """
 ============================================================
-  AngelOne API — NIFTY Options Straddle Trading Bot
+NIFTY Options Straddle Trading Bot
 ============================================================
 Strategy  : Momentum-filtered straddle (Buy CE + PE)
 Index     : NIFTY (Weekly expiry)
@@ -53,11 +53,11 @@ log = logging.getLogger("StraddleBot")
 #  1. CONFIGURATION  — edit these before running
 # ═══════════════════════════════════════════════════════════════
 class Config:
-    # ── AngelOne credentials ──────────────────────────────────
-    API_KEY        = os.getenv("ANGEL_API_KEY",    "YOUR_API_KEY")
-    CLIENT_ID      = os.getenv("ANGEL_CLIENT_ID",  "YOUR_CLIENT_ID")
-    PASSWORD       = os.getenv("ANGEL_PASSWORD",   "YOUR_PASSWORD")   # login PIN
-    TOTP_SECRET    = os.getenv("ANGEL_TOTP_SECRET","YOUR_TOTP_SECRET")# base-32 seed
+    # ── Platform credentials ──────────────────────────────────
+    API_KEY        = 
+    CLIENT_ID      =
+    PASSWORD       =   # login PIN
+    TOTP_SECRET    = # base-32 seed
 
     # ── Instrument ───────────────────────────────────────────
     UNDERLYING     = "NIFTY"
@@ -97,38 +97,8 @@ class Config:
 # ═══════════════════════════════════════════════════════════════
 #  2. AUTHENTICATION
 # ═══════════════════════════════════════════════════════════════
-class AngelSession:
-    """Handles login / token refresh for AngelOne SmartAPI."""
 
-    def __init__(self, cfg: Config):
-        self.cfg     = cfg
-        self.api     = SmartConnect(api_key=cfg.API_KEY)
-        self.token   = None
-        self.refresh = None
-        self.feed_token = None
-
-    def login(self) -> bool:
-        totp = pyotp.TOTP(self.cfg.TOTP_SECRET).now()
-        try:
-            resp = self.api.generateSession(
-                self.cfg.CLIENT_ID,
-                self.cfg.PASSWORD,
-                totp,
-            )
-            if resp["status"]:
-                self.token      = resp["data"]["jwtToken"]
-                self.refresh    = resp["data"]["refreshToken"]
-                self.feed_token = self.api.getfeedToken()
-                log.info("✅  Login successful — %s", self.cfg.CLIENT_ID)
-                return True
-            log.error("Login failed: %s", resp.get("message"))
-            return False
-        except Exception as exc:
-            log.exception("Login exception: %s", exc)
-            return False
-
-    def get_profile(self):
-        return self.api.getProfile(self.refresh)
+# Platform authentication details
 
 # ═══════════════════════════════════════════════════════════════
 #  3. INSTRUMENT LOOKUP
@@ -517,231 +487,8 @@ class Trade:
 # ═══════════════════════════════════════════════════════════════
 #  8. BOT — main orchestrator
 # ═══════════════════════════════════════════════════════════════
-class StraddleBot:
-    """
-    Main bot loop:
-      1. Login to AngelOne
-      2. Wait for entry window (09:17 IST)
-      3. Check momentum
-      4. Find closest-premium strikes for CE and PE
-      5. Buy both legs
-      6. Monitor each leg for target / SL / trail-SL
-      7. Square off open positions at 15:15 IST
-      8. Log daily summary
-    """
 
-    def __init__(self, cfg: Config):
-        self.cfg          = cfg
-        self.session      = AngelSession(cfg)
-        self.om           = OrderManager(self.session, cfg)
-        self.inst_mgr     = InstrumentManager()
-        self.momentum     = MomentumFilter(cfg)
-        self.trades:list[Trade] = []
-        self.daily_pnl    = 0.0
-        self.trade_counter = 0
-        self._stop_flag   = threading.Event()
-
-    # ── helpers ──────────────────────────────────────────────
-    def _now(self) -> datetime:
-        return datetime.now(self.cfg.TZ)
-
-    def _time_is(self, hh: int, mm: int) -> bool:
-        n = self._now()
-        return n.hour == hh and n.minute == mm
-
-    def _past(self, hh: int, mm: int) -> bool:
-        n = self._now()
-        return (n.hour, n.minute) >= (hh, mm)
-
-    def _before(self, hh: int, mm: int) -> bool:
-        return not self._past(hh, mm)
-
-    # ── login ────────────────────────────────────────────────
-    def start(self):
-        if not self.session.login():
-            log.critical("Cannot login. Exiting.")
-            sys.exit(1)
-        log.info(
-            "Bot started  |  DRY_RUN=%s  |  %s",
-            self.cfg.DRY_RUN, self._now().strftime("%Y-%m-%d"),
-        )
-        self._run_loop()
-
-    # ── main loop ────────────────────────────────────────────
-    def _run_loop(self):
-        active_trade: Trade | None = None
-
-        while not self._stop_flag.is_set():
-            now = self._now()
-
-            # ── Force square-off at market close ─────────────
-            if self._past(*self.cfg.MARKET_CLOSE):
-                if active_trade and active_trade.is_open:
-                    log.info("🔔  Market close — squaring off all positions.")
-                    self._square_off_trade(active_trade, reason="MARKET_CLOSE")
-                self._print_daily_summary()
-                log.info("🏁  Session ended. Stopping bot.")
-                break
-
-            # ── Fetch NIFTY spot ──────────────────────────────
-            spot = self.om.get_nifty_spot()
-            if spot is None:
-                log.warning("Could not fetch NIFTY spot. Retrying …")
-                time.sleep(self.cfg.POLL_SECONDS)
-                continue
-
-            self.momentum.record_price(spot)
-
-            # ── Monitor open trade ────────────────────────────
-            if active_trade and active_trade.is_open:
-                self._monitor_trade(active_trade)
-
-            # ── Attempt new entry ─────────────────────────────
-            elif (
-                not active_trade or not active_trade.is_open
-            ) and self._past(*self.cfg.ENTRY_START) and self._before(*self.cfg.ENTRY_CUTOFF):
-
-                # Daily loss limit check
-                if (
-                    self.cfg.MAX_DAILY_LOSS < 0
-                    and self.daily_pnl <= self.cfg.MAX_DAILY_LOSS
-                ):
-                    log.warning(
-                        "Daily loss limit ₹%.0f hit. No new entries.",
-                        self.cfg.MAX_DAILY_LOSS,
-                    )
-                else:
-                    confirmed, mom_pct = self.momentum.is_momentum_confirmed(spot)
-                    if confirmed:
-                        log.info(
-                            "📈  Momentum confirmed: %.2f%%  |  spot=₹%.2f",
-                            mom_pct, spot,
-                        )
-                        active_trade = self._enter_straddle(spot)
-                    else:
-                        log.debug(
-                            "Waiting for momentum … spot=₹%.2f  Δ=%.2f%%",
-                            spot, mom_pct,
-                        )
-
-            time.sleep(self.cfg.POLL_SECONDS)
-
-    # ── Enter straddle ────────────────────────────────────────
-    def _enter_straddle(self, spot: float) -> Trade | None:
-        expiry    = self.inst_mgr.get_weekly_expiry()
-        qty       = self.cfg.QUANTITY * self.cfg.NUM_LOTS
-
-        log.info(
-            "🔍  Finding strikes | spot=₹%.2f | expiry=%s | target_premium=₹%.0f",
-            spot, expiry, self.cfg.TARGET_PREMIUM,
-        )
-
-        ce_inst = self.inst_mgr.find_closest_premium_strike(
-            self.session.api, expiry, "CE",
-            self.cfg.TARGET_PREMIUM, spot,
-        )
-        pe_inst = self.inst_mgr.find_closest_premium_strike(
-            self.session.api, expiry, "PE",
-            self.cfg.TARGET_PREMIUM, spot,
-        )
-
-        if not ce_inst or not pe_inst:
-            log.warning("Could not find suitable strikes. Skipping entry.")
-            return None
-
-        # ── Buy CE ────────────────────────────────────────────
-        ce_ltp = ce_inst.get("_ltp", self.cfg.TARGET_PREMIUM)
-        ce_oid = self.om.place_order(
-            ce_inst["symbol"], ce_inst["token"], "BUY", qty,
-        )
-        # ── Buy PE ────────────────────────────────────────────
-        pe_ltp = pe_inst.get("_ltp", self.cfg.TARGET_PREMIUM)
-        pe_oid = self.om.place_order(
-            pe_inst["symbol"], pe_inst["token"], "BUY", qty,
-        )
-
-        if not ce_oid or not pe_oid:
-            log.error("Order placement failed. Aborting entry.")
-            return None
-
-        self.trade_counter += 1
-        trade = Trade(self.trade_counter, spot)
-
-        trade.add_leg(Leg(
-            option_type = "CE",
-            symbol      = ce_inst["symbol"],
-            token       = ce_inst["token"],
-            strike      = float(ce_inst["strike"]) / 100,
-            entry_price = ce_ltp,
-            quantity    = qty,
-            order_id    = ce_oid,
-            cfg         = self.cfg,
-        ))
-        trade.add_leg(Leg(
-            option_type = "PE",
-            symbol      = pe_inst["symbol"],
-            token       = pe_inst["token"],
-            strike      = float(pe_inst["strike"]) / 100,
-            entry_price = pe_ltp,
-            quantity    = qty,
-            order_id    = pe_oid,
-            cfg         = self.cfg,
-        ))
-
-        self.trades.append(trade)
-        log.info("🟢  Straddle entered — Trade #%d", self.trade_counter)
-        return trade
-
-    # ── Monitor trade ─────────────────────────────────────────
-    def _monitor_trade(self, trade: Trade):
-        for leg in trade.legs:
-            if not leg.is_open:
-                continue
-
-            ltp = self.om.get_ltp(
-                self.cfg.EXCHANGE, leg.symbol, leg.token,
-            )
-            if ltp is None:
-                continue
-
-            reason = leg.update(ltp)
-            if reason:
-                self._close_leg(leg, ltp, reason, trade)
-
-    def _close_leg(
-        self, leg: Leg, ltp: float, reason: str, trade: Trade,
-    ):
-        oid = self.om.place_order(
-            leg.symbol, leg.token, "SELL", leg.quantity,
-        )
-        exit_price = ltp   # for dry-run; in live, confirm fill price
-        leg.close(exit_price, reason)
-        self.daily_pnl += leg.realised_pnl
-        log.info(
-            "Daily P&L running total: ₹%.2f", self.daily_pnl,
-        )
-
-    def _square_off_trade(self, trade: Trade, reason: str):
-        for leg in trade.legs:
-            if not leg.is_open:
-                continue
-            ltp = self.om.get_ltp(
-                self.cfg.EXCHANGE, leg.symbol, leg.token,
-            ) or leg.entry_price
-            self._close_leg(leg, ltp, reason, trade)
-
-    # ── Daily summary ─────────────────────────────────────────
-    def _print_daily_summary(self):
-        log.info("=" * 60)
-        log.info("  DAILY SUMMARY — %s", date.today())
-        log.info("=" * 60)
-        for trade in self.trades:
-            log.info(trade.summary())
-        log.info("  Total Day P&L : ₹%.2f", self.daily_pnl)
-        log.info("=" * 60)
-
-    def stop(self):
-        self._stop_flag.set()
+# Input your platform details
 
 # ═══════════════════════════════════════════════════════════════
 #  9. ENTRY POINT
