@@ -1,7 +1,7 @@
 """
-============================================================
+=============================================================
 NIFTY Options Straddle Trading Bot
-============================================================
+=============================================================
 Strategy  : Momentum-filtered straddle (Buy CE + PE)
 Index     : NIFTY (Weekly expiry)
 Entry     : 09:17 – 15:15 IST, after momentum confirmation
